@@ -20,6 +20,6 @@
         'error6'                    => 'Please enter the API information.',
         'error-invalid-key'         => 'API Key is invalid.',
         'error-nid-required'        => 'The NID number is required before this .bd domain can be registered. Ask the client to submit the verification documents (NID) in the domain manager.',
+        'error-nid-invalid'         => 'The submitted NID number is invalid — it must be 10, 13 or 17 digits. Please correct it and resubmit.',
         'error-transfer-unsupported'=> 'Domain transfer is not supported for .bd domains. Please process transfers manually.',
-        'error-epp-unsupported'     => 'The .bd registry does not provide transfer (EPP) codes — transfers are not supported.',
     ];

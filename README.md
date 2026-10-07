@@ -29,33 +29,39 @@ Ported from the `get_bd` WHMCS module in this repository, adapted to WiseCP's
 ## How the flow works
 
 ```
-Checkout ──► service created (inprocess) ──► ModuleQueue: register()
-                                                │
-                                                ├─ NID/doc-fields already submitted?
-                                                │    ├─ yes ─► POST /orders → POST /orders/{id}/process
-                                                │    │          (documents-pending failure expected → SUCCESS,
-                                                │    │           order id stored in options.config.id)
-                                                │    └─ no  ─► register fails with a clear message
-                                                │              (queue retries 3×, then waits)
-                                                ▼
+Checkout ──► service goes ACTIVE (required: WiseCP only unlocks the client-area
+             document upload for active services) — NO order is created yet,
+             options.config.awaiting_docs = 1
+             │  client sees the verification banner: "documents required"
+             ▼
 Client submits NID + documents in the domain manager
-(WiseCP native doc-fields verification — action:domain.verification_submitted)
-                                                │
-                                                ├─ hook re-queues register() if it was blocked
-                                                ▼
-Admin verifies documents in WiseCP  ──►  cron polls get.bd every 15 min per service:
-   • order not processed yet + docs verified  → POST /orders/{id}/process (retry)
-   • staff approves documents in the Get BD partner portal
-     (partner.get.bd/orders/{id}) — order id is in options.config.id
-                                                │
-                                                ▼
-Registry activates the domain (localDomain.isActive = true)
-   → module cron immediately writes the real expiry date into the WiseCP
-     service (duedate) and flags it activated — no waiting on WiseCP's
-     daily DomainStatusSync (which has a 7-day cooldown for pending domains)
-   → WiseCP's own DomainStatusSync cron remains the long-term backstop
-     for expiry-date corrections
+(WiseCP native doc-fields — action:domain.verification_submitted)
+             │  hook re-queues register() (cron = hourly safety net)
+             ▼
+register(): POST /orders (with NID) → POST /orders/{id}/process
+   (documents-pending failure expected) → returns status "inprocess"
+             ▼
+Service shows PENDING while BTCL reviews the documents
+   — cron polls GET /domains/info every 15 min per service:
+      • docs verified in WiseCP → retry POST /orders/{id}/process
+      • staff approves documents in the Get BD partner portal
+        (partner.get.bd/orders/{id}; order id in options.config.id)
+             ▼
+BTCL activates the domain (localDomain.isActive = true)
+   → cron flips the service to ACTIVE via Services::change_status
+     (client receives the activation notification), writes the real
+     registry expiry date into duedate, and stops polling
+   → WiseCP's daily DomainStatusSync cron remains the long-term backstop
 ```
+
+Status truthfulness: "Active" only ever means the domain is live at the
+registry — except the initial doc-collection phase, where the service is
+active but the client-area verification banner ("documents required")
+explains that the domain is waiting on the client's own documents. If the
+client stays silent for 2+ days the module notifies the admin once.
+
+If the client submits an invalid NID (not 10/13/17 digits), registration
+fails with a clear admin-visible error so it can be corrected.
 
 ### Notes on the document lifecycle
 
@@ -66,10 +72,24 @@ Registry activates the domain (localDomain.isActive = true)
   `/documents/upload` endpoint, but this integration (matching the WHMCS module) leaves
   document upload/approval to staff in the partner portal. The WiseCP doc record is the
   local audit trail and gates the processing retries.
-- If registration was attempted before the client submitted the NID, the queue item fails
-  after 3 attempts (expected). Once documents are submitted, the
-  `action:domain.verification_submitted` hook re-queues registration automatically; the
-  `PerMinuteCronJob` hook is the safety net (re-queue throttled to 1/hour).
+- Why the service must be active at first: WiseCP's client-area verification submission
+  is hard-gated to active services (core limitation). Hence the two-phase status:
+  active while collecting documents → pending during BTCL review → active when live.
+- If the client never submits documents, the module notifies the admin once after 2 days.
+- **Pre-existing / imported domains** (registered outside this flow, no order id and no
+  awaiting-docs flag): the cron probes the registry once, marks their doc-fields verified
+  (with the real NID from `GET /domains/info` when available) and stops polling — the
+  client area never shows a "Verify" prompt for them.
+- **Per-TLD document matrix** (in `config.php`): `.bd` and `.id.bd` require NID **or**
+  passport; `.com.bd` / `.co.bd` require trade licence **+** NID; `.org.bd` requires a
+  registration certificate; `.edu.bd` EIIN/UGC approval; `.sch.bd` EIIN certificate;
+  `.net.bd` / `.info.bd` / `.ai.bd` / `.tv.bd` accept NID **or** trade licence (the
+  licence upload is optional there). The applicant NID is collected for every TLD
+  because the get.bd order API requires an `nid` value.
+- The client-area 4th nameserver input is hidden on GetBD domain pages via the
+  `ui:client.domain_detail.nameservers.bottom` template hook; the module also drops any
+  4th nameserver server-side. No EPP/transfer UI exists — the module has no
+  `get_auth_code()` method, which is how WiseCP detects the capability.
 
 ## Supported operations
 
