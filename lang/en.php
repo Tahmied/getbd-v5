@@ -5,15 +5,11 @@
         'description' => 'Register and manage .bd domains through the Get BD partner API. .bd registrations require NID verification and document approval by BTCL before activation.',
 
         'fields' => [
-            'test-mode'        => 'Sandbox Mode',
-            'api-key'          => 'API Key',
-            'api-key-sandbox'  => 'Sandbox API Key',
+            'api-key' => 'API Key',
         ],
 
         'desc' => [
-            'test-mode'       => 'Use sandbox-api.get.bd instead of the live API.',
-            'api-key'         => 'Get BD partner API key (live mode).',
-            'api-key-sandbox' => 'Get BD partner API key (sandbox mode).',
+            'api-key' => 'Get BD partner API key.',
         ],
 
         'error2'                    => 'Domain and extension information is missing.',

@@ -2,10 +2,14 @@
 /**
  * GetBD Registrar Module for WiseCP — API Client
  *
- * JSON client for the get.bd partner API (api.get.bd / sandbox-api.get.bd).
- * Ported from the get_bd WHMCS module's GetBDClient, adapted to WiseCP
- * conventions: errors go to $this->error (no exceptions), calls are logged
- * through the $logger closure (wired to RegistrarModule::save_log()).
+ * JSON client for the get.bd partner API (api.get.bd). Ported from the
+ * get_bd WHMCS module's GetBDClient, adapted to WiseCP conventions: errors
+ * go to $this->error (no exceptions), calls are logged through the $logger
+ * closure (wired to RegistrarModule::save_log()).
+ *
+ * Note: get.bd has no hosted sandbox — its "development" environment is a
+ * self-hosted server (see the official API docs). Every request requires
+ * the partner API key, so the previous sandbox toggle was removed.
  */
 
     namespace WISECP\Modules\Registrars\GetBD;
@@ -20,20 +24,12 @@
         private string $apiKey;
         private string $baseUrl;
 
-        public const LIVE_BASE    = 'https://api.get.bd/api/v1/external';
-        public const SANDBOX_BASE = 'https://sandbox-api.get.bd/api/v1/external';
+        public const LIVE_BASE = 'https://api.get.bd/api/v1/external';
 
         public function __construct(array $settings = [])
         {
             $this->apiKey  = trim((string) ($settings['api-key'] ?? $settings['api_key'] ?? ''));
             $this->baseUrl = self::LIVE_BASE;
-
-            if (!empty($settings['test-mode'])) {
-                $this->baseUrl = self::SANDBOX_BASE;
-
-                if ($sandboxKey = trim((string) ($settings['api-key-sandbox'] ?? '')))
-                    $this->apiKey = $sandboxKey;
-            }
 
             if ($this->apiKey === '')
                 $this->error = 'Get BD API key is required.';

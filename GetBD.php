@@ -3,7 +3,7 @@
  * WISECP — GetBD Domain Registrar Module
  *
  * Registrar module for .bd domains via the Get BD partner API
- * (https://api.get.bd/api/v1/external, sandbox: sandbox-api.get.bd).
+ * (https://api.get.bd/api/v1/external).
  *
  * .bd domains are governed by BTCL rules: a registration requires the
  * registrant's NID and supporting documents, and the domain does not
@@ -40,9 +40,27 @@
 
             include_once __DIR__ . DS . 'ApiClient.php';
 
-            $settings = $this->config['settings'] ?? [];
-            if ($key = $this->decode_str($settings['api-key'] ?? ''))           $settings['api-key'] = $key;
-            if ($key = $this->decode_str($settings['api-key-sandbox'] ?? ''))   $settings['api-key-sandbox'] = $key;
+            $settings = is_array($this->config['settings'] ?? null) ? $this->config['settings'] : [];
+
+            // WiseCP caches the parsed module config in memory for the whole
+            // request, and PHP OPcache can serve stale bytecode after file
+            // updates — either can leave the key empty even though the file
+            // on disk has it. Re-read config.php directly as a fallback.
+            if (trim((string) ($settings['api-key'] ?? '')) === '') {
+                $raw = @include $this->dir . 'config.php';
+                if (is_array($raw) && is_array($raw['settings'] ?? null))
+                    $settings = array_merge($raw['settings'], $settings);
+            }
+
+            // Settings may be stored plaintext or encrypted (WiseCP saves
+            // password-type fields encrypted in some setups) — only swap in
+            // the decrypted value when decryption actually yields one.
+            try {
+                if ($key = $this->decode_str((string) ($settings['api-key'] ?? '')))
+                    $settings['api-key'] = $key;
+            } catch (\Throwable $e) {
+                // plaintext key — keep as-is
+            }
 
             $this->api = new ApiClient($settings);
             $this->api->logger = fn($action, $req, $resp, $processed = '') => $this->save_log($action, $req, $resp, $processed);
@@ -51,44 +69,51 @@
 
         public function config_fields($settings = []): array
         {
-            $sandbox = !empty($settings['test-mode']);
-            $toggle  = "var d=this.closest('form')||document;"
-                     . "d.querySelectorAll('.sandbox-row').forEach(function(r){r.classList.toggle('d-none',!this.checked);}.bind(this));"
-                     . "d.querySelectorAll('.not-sandbox-row').forEach(function(r){r.classList.toggle('d-none',this.checked);}.bind(this));";
-
             return [
-                'test-mode' => [
-                    'type'         => 'approval',
-                    'name'         => $this->lang['fields']['test-mode'] ?? 'Sandbox Mode',
-                    'description'  => $this->lang['desc']['test-mode'] ?? 'Use sandbox-api.get.bd instead of the live API.',
-                    'value'        => 1,
-                    'checked'      => $sandbox,
-                    'fieldOptions' => ['attributes' => ['onchange' => $toggle]],
-                ],
                 'api-key' => [
                     'type'         => 'password',
                     'name'         => $this->lang['fields']['api-key'] ?? 'API Key',
-                    'description'  => $this->lang['desc']['api-key'] ?? 'Get BD partner API key (live mode).',
+                    'description'  => $this->lang['desc']['api-key'] ?? 'Get BD partner API key.',
                     'value'        => $settings['api-key'] ?? '',
-                    'fieldOptions' => ['rowClassExtra' => ($sandbox ? 'd-none ' : '') . 'not-sandbox-row'],
-                ],
-                'api-key-sandbox' => [
-                    'type'         => 'password',
-                    'name'         => $this->lang['fields']['api-key-sandbox'] ?? 'Sandbox API Key',
-                    'description'  => $this->lang['desc']['api-key-sandbox'] ?? 'Get BD partner API key (sandbox mode).',
-                    'value'        => $settings['api-key-sandbox'] ?? '',
-                    'fieldOptions' => ['rowClassExtra' => ($sandbox ? '' : 'd-none ') . 'sandbox-row'],
                 ],
             ];
+        }
+
+        /**
+         * WiseCP's settings save rewrites config.php as a static array export,
+         * which would freeze the doc-fields into every context (leaking them
+         * into the checkout). After the parent saves the settings, regenerate
+         * config.php from our dynamic template, carrying the saved settings.
+         */
+        public function controller_settings($extraFields = []): array
+        {
+            $result = parent::controller_settings($extraFields);
+            $this->regenerate_config();
+            return $result;
+        }
+
+        private function regenerate_config(): void
+        {
+            $saved    = @include $this->dir . 'config.php';
+            $settings = is_array($saved) ? ($saved['settings'] ?? []) : [];
+            unset($settings['doc-fields']);
+
+            $source = "<?php\n\n"
+                . "    // GetBD module configuration — REGENERATED by the module after\n"
+                . "    // every settings save. Edit config.template.php / doc-fields.php\n"
+                . "    // instead; hand-edits to this file will be lost.\n\n"
+                . "    \$getbd_settings = " . var_export($settings, true) . ";\n\n"
+                . "    return require __DIR__ . DS . 'config.template.php';\n";
+
+            \FileManager::file_write($this->dir . 'config.php', $source);
         }
 
         public function testConnection($config = []): bool
         {
             $settings = $config['settings'] ?? [];
             $key      = trim((string) ($settings['api-key'] ?? ''));
-            $skey     = trim((string) ($settings['api-key-sandbox'] ?? ''));
 
-            if ((!empty($settings['test-mode']) && $skey === '') || (empty($settings['test-mode']) && $key === '')) {
+            if ($key === '') {
                 $this->error = $this->lang['error6'] ?? 'Please enter the API information.';
                 return false;
             }
@@ -156,7 +181,9 @@
 
         public function register(): array|bool
         {
-            $this->error = null;
+            // NOTE: $error is a non-nullable string on RegistrarModule — never
+            // assign null to it (fatal TypeError otherwise).
+            $this->error = '';
             $this->initApi();
             [$domain] = $this->domain_parts();
 
@@ -546,25 +573,8 @@
                         // this flow): it will never get a WiseCP-driven order,
                         // so mark its doc-fields verified and stop polling —
                         // this removes the "Verify" prompt from the client area.
-                        if (($row['status'] ?? '') === 'active' && $this->doc_check_due($options)) {
-                            $this->initApi();
-                            $info      = $this->getDomainInfoRaw($domain);
-                            $known     = is_array($info) && !empty($info['success']);
-                            $notFound  = !$known && $this->api->lastHttpCode === 404;
-
-                            if ($known || $notFound) {
-                                $this->autoverify_docs(
-                                    $serviceId,
-                                    $required,
-                                    (array) ($docFields[$tld] ?? []),
-                                    $latest,
-                                    (string) ($info['data']['clientNid'] ?? '')
-                                );
-                                $options['getbd_activated'] = 1;
-                            }
-
-                            $options['getbd_doc_check'] = \DateManager::Now();
-                            \Services::set($serviceId, ['options' => $options]);
+                        if (($row['status'] ?? '') === 'active') {
+                            $this->check_existing_service($serviceId, $row);
                         }
                         continue;
                     }
@@ -620,6 +630,63 @@
                 $options['getbd_doc_check'] = \DateManager::Now();
                 \Services::set($serviceId, ['options' => $options]);
             }
+        }
+
+        /**
+         * Pre-existing domain check (cron + domain.detail.viewed hook).
+         * For a domain that never went through this module's order flow
+         * (no order id, no awaiting-docs flag): probe the registry once,
+         * mark its doc-fields verified and stop polling. WiseCP computes the
+         * client-area "Verify" prompt from those doc rows, so the prompt
+         * disappears for domains that were pre-activated elsewhere.
+         */
+        public function check_existing_service(int $serviceId, array $row = []): void
+        {
+            if (!$row) {
+                $stmt = \WDB::select('id, name, status, duedate, cdate, options')->from('users_products');
+                $stmt->where('id', '=', $serviceId, '&&');
+                $stmt->where('type', '=', 'domain', '&&');
+                $stmt->where('module', '=', $this->_name);
+                if (!$stmt->build()) return;
+                $row = \WDB::getAssoc() ?: [];
+            }
+
+            if (!$row || ($row['status'] ?? '') !== 'active') return;
+
+            $options = \Utility::jdecode((string) ($row['options'] ?? ''), true) ?: [];
+            if (!empty($options['getbd_activated'])) return;
+            if (!empty($options['config']['id']) || !empty($options['config']['awaiting_docs'])) return;
+            if (!$this->doc_check_due($options)) return;
+
+            $docFields = $this->config['settings']['doc-fields'] ?? [];
+            $domain    = strtolower((string) ($options['domain'] ?? $row['name'] ?? ''));
+            $tld       = strpos($domain, '.') !== false ? substr($domain, strpos($domain, '.') + 1) : '';
+            $tldFields = (array) ($docFields[$tld] ?? []);
+
+            $required = [];
+            foreach ($tldFields as $key => $field)
+                if (is_array($field) && ($field['required'] ?? false)) $required[] = (string) $key;
+            if (!$required) return;
+
+            $stmt   = \WDB::select('doc_id, status')->from('users_products_docs')
+                ->where('owner_id', '=', $serviceId)
+                ->order_by('id ASC');
+            $latest = [];
+            if ($stmt->build()) foreach (\WDB::fetch_assoc() as $doc)
+                $latest[(string) ($doc['doc_id'] ?? '')] = (string) ($doc['status'] ?? 'unsent');
+
+            $this->initApi();
+            $info     = $this->getDomainInfoRaw($domain);
+            $known    = is_array($info) && !empty($info['success']);
+            $notFound = !$known && $this->api->lastHttpCode === 404;
+
+            if ($known || $notFound) {
+                $this->autoverify_docs($serviceId, $required, $tldFields, $latest, (string) ($info['data']['clientNid'] ?? ''));
+                $options['getbd_activated'] = 1;
+            }
+
+            $options['getbd_doc_check'] = \DateManager::Now();
+            \Services::set($serviceId, ['options' => $options]);
         }
 
         /**
@@ -758,7 +825,8 @@
                 if (strpos($digits, '0') === 0)   $digits = substr($digits, 1);
                 $digits = substr($digits, 0, 10);
 
-                if (strlen($digits) < 10) continue;
+                // get.bd API requires exactly +8801[3-9]XXXXXXXX (BD mobile).
+                if (!preg_match('/^1[3-9]\d{8}$/', $digits)) continue;
 
                 return '+880' . $digits;
             }
@@ -808,6 +876,60 @@
         if (($row['module'] ?? '') !== 'GetBD') return '';
 
         return '<script>(function(){var h=function(){var el=document.getElementById("ddNs4");if(!el)return;var b=el.closest(".col-sm-6")||el.parentElement;if(b)b.style.display="none";};if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",h);else h();})();</script>';
+    });
+
+    /**
+     * A pre-activated domain is opened in the client area — run the
+     * existing-domain check synchronously (the cron is the safety net) so
+     * the "Verify" prompt disappears without waiting for the cron.
+     */
+    \Hook::add('action:domain.detail.viewed', 1, function ($service, $serviceId) {
+        if (!is_array($service)) return;
+        if (($service['module'] ?? '') !== 'GetBD' || ($service['type'] ?? '') !== 'domain') return;
+
+        \Modules::Load('Registrars', 'GetBD');
+        $module = new GetBD();
+        $module->check_existing_service((int) $serviceId, $service);
+    });
+
+    /**
+     * UI hook (domains list): for .bd domains rename the verify CTA to
+     * "Complete Verification", and HIDE it entirely for pre-activated
+     * domains — active GetBD services with no order id and no awaiting-docs
+     * flag never went through this module's registration flow, so they must
+     * never be asked for documents (works regardless of API/cron health).
+     */
+    \Hook::add('ui:client.domains_list.modals.end', 1, function () {
+        $hidden = [];
+
+        $rows = \WDB::select('name, options')->from('users_products');
+        $rows->where('type', '=', 'domain', '&&');
+        $rows->where('module', '=', 'GetBD', '&&');
+        $rows->where('status', '=', 'active');
+        if ($rows->build()) {
+            foreach (\WDB::fetch_assoc() as $r) {
+                $opts = \Utility::jdecode((string) ($r['options'] ?? ''), true) ?: [];
+                if (empty($opts['config']['id']) && empty($opts['config']['awaiting_docs']))
+                    $hidden[] = strtolower((string) ($r['name'] ?? ''));
+            }
+        }
+
+        $tlds     = 'bd|com\\.bd|net\\.bd|org\\.bd|edu\\.bd|info\\.bd|id\\.bd|sch\\.bd|co\\.bd|ai\\.bd|tv\\.bd';
+        $hideList = json_encode($hidden) ?: '[]';
+
+        return '<script>(function(){'
+            . 'var hidden=' . $hideList . ';'
+            . 'var re=/\\.(' . $tlds . ')$/i;'
+            . 'function fix(){'
+            . 'document.querySelectorAll(\'button[data-bs-target="#domainVerifyModal"][data-domain]\').forEach(function(b){'
+            . 'var d=(b.getAttribute("data-domain")||"").toLowerCase();'
+            . 'if(!re.test(d))return;'
+            . 'if(hidden.indexOf(d)!==-1){b.style.display="none";return;}'
+            . 'var i=b.querySelector("i");b.textContent="";if(i)b.appendChild(i);'
+            . 'b.appendChild(document.createTextNode(" Complete Verification"));'
+            . '});}'
+            . 'if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",fix);else fix();'
+            . '})();</script>';
     });
 
     /**

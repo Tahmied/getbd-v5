@@ -1,7 +1,7 @@
-# GetBD — WiseCP Domain Registrar Module
+| `ApiClient.php` | JSON cURL client for the Get BD API (live only, logging into the WiseCP module log) |# GetBD — WiseCP Domain Registrar Module
 
 WiseCP registrar module for **.bd domains** via the [Get BD](https://get.bd) partner API
-(`https://api.get.bd/api/v1/external`, sandbox: `https://sandbox-api.get.bd/api/v1/external`).
+(`https://api.get.bd/api/v1/external` — there is no hosted sandbox; the "development" environment in get.bd's docs is a self-hosted server, and every request needs the partner API key).
 
 Ported from the `get_bd` WHMCS module in this repository, adapted to WiseCP's
 `RegistrarModule` class contract (mirrors `coremio/modules/Registrars/Freenom` / `Namecheap`).
@@ -20,48 +20,62 @@ Ported from the `get_bd` WHMCS module in this repository, adapted to WiseCP's
 ## Installation
 
 1. Copy this folder to `coremio/modules/Registrars/GetBD/` in your WiseCP install.
-2. Admin area → Registrars → **GetBD** → enter your API Key (and Sandbox key if used),
-   toggle Sandbox Mode as needed, save (a connection test runs automatically).
+2. Admin area → Registrars → **GetBD** → enter your API Key and save (a connection test runs
+   automatically). After every save the module regenerates its own config.php — this is
+   required and must not be skipped, otherwise the checkout suppression breaks.
 3. Products → Domain Extensions: create the .bd TLDs you sell (`bd`, `com.bd`, `net.bd`,
-   `org.bd`, `edu.bd`, `info.bd`, `biz.bd`, `ac.bd`, `gov.bd`, `mil.bd`, `tv.bd`, `id.bd`)
-   and assign the **GetBD** module to each.
+   `org.bd`, `edu.bd`, `info.bd`, `id.bd`, `sch.bd`, `co.bd`, `ai.bd`, `tv.bd`)
+   and assign the **GetBD** module to each. Set the per-TLD prices/periods there as well
+   (the module does not manage pricing).
+
+> **IMPORTANT — do not skip step 2's save.** WiseCP rewrites `config.php` to a static
+> export whenever module settings are saved, which would leak the verification fields
+> into the checkout. The module counteracts this by regenerating `config.php` from
+> `config.template.php` + `doc-fields.php` after every save. If you ever copy files
+> over an existing install, re-enter the API key and save once.
+
+> **After copying module files, restart PHP-FPM / clear OPcache.** WiseCP caches the
+> parsed config in memory per request and OPcache can keep serving stale bytecode,
+> so the module may briefly run with an empty API key even though `config.php` has
+> it. The module re-reads `config.php` directly as a fallback, but a cache restart
+> is the clean fix.
 
 ## How the flow works
 
 ```
-Checkout ──► service goes ACTIVE (required: WiseCP only unlocks the client-area
-             document upload for active services) — NO order is created yet,
-             options.config.awaiting_docs = 1
-             │  client sees the verification banner: "documents required"
-             ▼
-Client submits NID + documents in the domain manager
-(WiseCP native doc-fields — action:domain.verification_submitted)
-             │  hook re-queues register() (cron = hourly safety net)
-             ▼
+Checkout — frictionless: NO document fields (doc-fields are suppressed on the
+cart/configure/checkout flow in config.php; WiseCP validates them server-side
+at checkout, so the suppression must be server-side, not JS)
+   │  register() pass 1: no NID yet → service goes ACTIVE with
+   │  options.config.awaiting_docs = 1, no order created
+   ▼
+Domains page → "Complete Verification" button (renamed from "Verify" for .bd
+domains via the ui:client.domains_list.modals.end hook)
+   │  client submits NID + documents (WiseCP native verification modal)
+   │  action:domain.verification_submitted → register() re-queued
+   ▼
 register(): POST /orders (with NID) → POST /orders/{id}/process
    (documents-pending failure expected) → returns status "inprocess"
-             ▼
-Service shows PENDING while BTCL reviews the documents
+   ▼
+Service shows PENDING while BTCL reviews
    — cron polls GET /domains/info every 15 min per service:
       • docs verified in WiseCP → retry POST /orders/{id}/process
       • staff approves documents in the Get BD partner portal
-        (partner.get.bd/orders/{id}; order id in options.config.id)
-             ▼
-BTCL activates the domain (localDomain.isActive = true)
-   → cron flips the service to ACTIVE via Services::change_status
-     (client receives the activation notification), writes the real
-     registry expiry date into duedate, and stops polling
-   → WiseCP's daily DomainStatusSync cron remains the long-term backstop
+   ▼
+BTCL activates the domain → cron flips the service to ACTIVE
+(Services::change_status, client notified), writes the real expiry date,
+stops polling. WiseCP's daily DomainStatusSync remains the backstop.
+
+Pre-existing / pre-activated domains (imported, no order id, no awaiting_docs
+flag): auto-verified — cron does it, AND it runs synchronously whenever the
+domain page is viewed (action:domain.detail.viewed), so the Verify prompt
+disappears without waiting for the cron.
 ```
 
-Status truthfulness: "Active" only ever means the domain is live at the
-registry — except the initial doc-collection phase, where the service is
-active but the client-area verification banner ("documents required")
-explains that the domain is waiting on the client's own documents. If the
-client stays silent for 2+ days the module notifies the admin once.
-
-If the client submits an invalid NID (not 10/13/17 digits), registration
-fails with a clear admin-visible error so it can be corrected.
+**CRITICAL implementation note:** `RegistrarModule::$error` is a non-nullable
+`string` — assigning `null` to it (e.g. resetting it at the top of a method)
+throws a fatal TypeError and kills the whole registration. Always reset with
+`$this->error = '';`.
 
 ### Notes on the document lifecycle
 
@@ -111,7 +125,7 @@ fails with a clear admin-visible error so it can be corrected.
 | File | Purpose |
 |---|---|
 | `GetBD.php` | Module class (`WISECP\Modules\Registrars\GetBD extends RegistrarModule`) + hook registrations |
-| `ApiClient.php` | JSON cURL client for the Get BD API (live/sandbox, logging into the WiseCP module log) |
+| `ApiClient.php` | JSON cURL client for the Get BD API (live only, logging into the WiseCP module log) |
 | `config.php` | Module meta + settings + per-TLD `doc-fields` definitions |
 | `lang/en.php` | Language strings |
 | `logo.png`, `index.html` | Module logo, directory guard |
