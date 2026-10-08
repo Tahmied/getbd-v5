@@ -91,6 +91,21 @@ class ApiClient
      * uploading over a REJECTED one replaces it), file (images except SVG,
      * PDF, DOC/DOCX — content inspected against declared type, max 5 MB).
      */
+    private static function mimeFor(string $path): string
+    {
+        return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
+            'png'                     => 'image/png',
+            'jpg', 'jpeg'             => 'image/jpeg',
+            'gif'                     => 'image/gif',
+            'webp'                    => 'image/webp',
+            'bmp'                     => 'image/bmp',
+            'pdf'                     => 'application/pdf',
+            'doc'                     => 'application/msword',
+            'docx'                    => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            default                   => 'application/octet-stream',
+        };
+    }
+
     public function uploadDocument(string $orderId, string $documentType, string $filePath, string $originalName): array
     {
         if (!is_file($filePath)) {
@@ -98,10 +113,14 @@ class ApiClient
         }
 
         return $this->request('POST', '/documents/upload', [
+            // NOTE: raw curl needs a FLAT field => value array; nested
+            // Guzzle-style arrays get string-cast into form fields "0","1","2"
+            // (that is exactly the "Unrecognized keys" 400 seen live).
+            // CURLFile makes curl emit a real multipart file part.
             'multipart' => [
-                ['name' => 'orderId', 'contents' => $orderId],
-                ['name' => 'documentType', 'contents' => $documentType],
-                ['name' => 'file', 'contents' => fopen($filePath, 'rb'), 'filename' => $originalName],
+                'orderId'      => $orderId,
+                'documentType' => $documentType,
+                'file'         => new \CURLFile($filePath, self::mimeFor($filePath), $originalName),
             ],
         ]);
     }
@@ -160,7 +179,9 @@ class ApiClient
 
         $logPayload = isset($options['json'])
             ? $body
-            : (isset($options['query']) ? json_encode($options['query']) : ($options['multipart'] ?? [] ? '(multipart)' : ''));
+            : (isset($options['multipart'])
+                ? json_encode(['multipart_fields' => array_keys($options['multipart'])])
+                : (isset($options['query']) ? json_encode($options['query']) : ''));
 
         $ch = curl_init($url);
         curl_setopt_array($ch, [

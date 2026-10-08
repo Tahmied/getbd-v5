@@ -94,6 +94,19 @@ sees these), `getbd_last_cron`, `getbd_last_process_retry`.
 - Field-validation failures from get.bd (its `errorMessages[]`) are surfaced to the
   client and logged, so e.g. a bad postcode is fixable without support.
 
+## Admin notifications (the bell)
+
+`Admin::notify()` — the same API WiseCP core crons use. Events (deduplicated while pending,
+so a persistent failure alerts once per distinct error, not per cron tick):
+
+| Event | Level | Fires when |
+|---|---|---|
+| `getbd-domain-activated` | success | cron flips a domain active (domain, service id, order, expiry) |
+| `getbd-order-create-failed` | error | create-order call failed (domain, service id, error) |
+| `getbd-order-process-failed` | warning | process failed with a non-doc-gate error — e.g. **Insufficient balance** (deduped per service+error) |
+| `getbd-document-upload-failed` | warning | any document could not reach get.bd (upload via partner portal fallback) |
+| `getbd-reservation-problem` | error | order not found / 7-day reservation expired |
+
 ## Admin notes
 
 - If `getbd_error` mentions the **wallet** or **RESERVATION_EXPIRED**, fix it in the

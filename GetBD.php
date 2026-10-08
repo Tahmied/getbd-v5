@@ -604,6 +604,13 @@ class GetBD extends RegistrarModule
             }
             if ($uploadFailures) {
                 $this->options['getbd_error'] = $uploadFailures . ' document(s) could not be forwarded to get.bd automatically; upload them via the partner portal.';
+                $this->save_options();
+                $this->notifyAdmin('getbd-document-upload-failed', [
+                    'domain'     => (string) ($this->options['domain'] ?? ''),
+                    'service_id' => $serviceId,
+                    'order_id'   => $orderId,
+                    'failed'     => $uploadFailures,
+                ], 'warning', ['service_id']);
             }
 
             $this->options['getbd_state'] = 'submitted';
@@ -616,6 +623,12 @@ class GetBD extends RegistrarModule
                     if ($message !== '' && !str_contains($message, self::PROCESS_DOC_GATE_SNIPPET)) {
                         $this->options['getbd_error'] = mb_substr($message, 0, 250);
                         $this->save_log('verify.processOrder.failed', $orderId, $message);
+                        $this->notifyAdmin('getbd-order-process-failed', [
+                            'domain'     => (string) ($this->options['domain'] ?? ''),
+                            'service_id' => $serviceId,
+                            'order_id'   => $orderId,
+                            'error'      => mb_substr($message, 0, 200),
+                        ], 'warning', ['service_id', 'error']);
                     }
                 }
             } catch (\Throwable $e) {
@@ -623,6 +636,12 @@ class GetBD extends RegistrarModule
                 if (!str_contains($message, self::PROCESS_DOC_GATE_SNIPPET)) {
                     $this->options['getbd_error'] = mb_substr($message, 0, 250);
                     $this->save_log('verify.processOrder.failed', $orderId, $message);
+                    $this->notifyAdmin('getbd-order-process-failed', [
+                        'domain'     => (string) ($this->options['domain'] ?? ''),
+                        'service_id' => $serviceId,
+                        'order_id'   => $orderId,
+                        'error'      => mb_substr($message, 0, 200),
+                    ], 'warning', ['service_id', 'error']);
                 }
             }
             $this->save_options();
@@ -739,16 +758,11 @@ class GetBD extends RegistrarModule
     {
         if (!headers_sent())
             header('Cache-Control: no-store');
-
-        self::debugLog("=== respondPendingState START === bridgeVersion: " . $bridgeVersion);
-
         $states = new \stdClass();
         try {
             $member = \UserManager::LoginData('member');
             $ctx = $member ? \UserManager::activeAccount() : [];
             $uid = (int) ($ctx['owner_id'] ?? 0);
-            self::debugLog("Logged in member owner_id: " . $uid);
-
             if ($uid) {
                 $q = \WDB::select('id, name, status, options')->from('users_products');
                 $q->where('type', '=', 'domain', '&&');
@@ -757,23 +771,17 @@ class GetBD extends RegistrarModule
 
                 // FIX: fetch_assoc() returns a list of rows; getAssoc() only returns one row
                 $rows = $q->build() ? \WDB::fetch_assoc() : [];
-                self::debugLog("DB query executed. Rows found: " . count((array) $rows));
-
                 $list = [];
                 foreach ((array) $rows as $row) {
                     $rowData = is_object($row) ? (array) $row : (is_array($row) ? $row : []);
 
                     if (empty($rowData)) {
-                        self::debugLog("  -> Skipped: row is empty or invalid type: " . gettype($row));
                         continue;
                     }
 
                     $rowId = (string) ($rowData['id'] ?? '');
                     $status = (string) ($rowData['status'] ?? '');
-                    self::debugLog("Evaluating row ID: " . $rowId . " | status: " . $status);
-
                     if (!in_array($status, ['waiting', 'inprocess'], true)) {
-                        self::debugLog("  -> Skipped: status not waiting/inprocess");
                         continue;
                     }
 
@@ -784,9 +792,6 @@ class GetBD extends RegistrarModule
                     $hasOrder = !empty($opts['getbd_order_id']);
                     $state = (string) ($opts['getbd_state'] ?? '');
                     $isSubmitted = $hasOrder || in_array($state, ['submitting', 'submitted'], true);
-
-                    self::debugLog("  -> ID: " . $rowId . " | hasOrder: " . ($hasOrder ? 'yes' : 'no') . " | state: '" . $state . "' | isSubmitted: " . ($isSubmitted ? 'YES' : 'NO'));
-
                     $list[$rowId] = [
                         'domain' => (string) ($rowData['name'] ?? ''),
                         'submitted' => $isSubmitted,
@@ -794,12 +799,9 @@ class GetBD extends RegistrarModule
                 }
                 if ($list)
                     $states = $list;
-                self::debugLog("Final states object to return: " . json_encode($states));
             } else {
-                self::debugLog("No owner_id found for logged in user.");
             }
         } catch (\Throwable $e) {
-            self::debugLog("EXCEPTION in respondPendingState: " . $e->getMessage() . " in " . $e->getFile() . ":" . $e->getLine());
             $this->save_log('state.exception', '', $e->getMessage());
         }
 
@@ -876,6 +878,12 @@ class GetBD extends RegistrarModule
                 $this->options['getbd_error'] = mb_substr($message, 0, 250);
                 $this->save_options();
                 $this->save_log('cron.reservationProblem', \Utility::jencode(['service' => $serviceId, 'order' => $orderId]), $message);
+                $this->notifyAdmin('getbd-reservation-problem', [
+                    'domain'     => (string) ($this->options['domain'] ?? ''),
+                    'service_id' => $serviceId,
+                    'order_id'   => $orderId,
+                    'error'      => mb_substr($message, 0, 200),
+                ], 'error', ['service_id', 'error']);
             }
             return;
         }
@@ -901,6 +909,12 @@ class GetBD extends RegistrarModule
             ]);
 
             $this->save_log('cron.activated', \Utility::jencode(['service' => $serviceId, 'order' => $orderId, 'expiry' => $expiry]), 'ok');
+            $this->notifyAdmin('getbd-domain-activated', [
+                'domain'     => (string) ($this->options['domain'] ?? ''),
+                'service_id' => $serviceId,
+                'order_id'   => $orderId,
+                'expiry'     => $expiry,
+            ], 'success');
             return;
         }
 
@@ -923,6 +937,12 @@ class GetBD extends RegistrarModule
                     $this->options['getbd_error'] = mb_substr($message, 0, 250);
                     $this->save_options();
                     $this->save_log('cron.processOrder.failed', $orderId, $message);
+                    $this->notifyAdmin('getbd-order-process-failed', [
+                        'domain'     => (string) ($this->options['domain'] ?? ''),
+                        'service_id' => $serviceId,
+                        'order_id'   => $orderId,
+                        'error'      => mb_substr($message, 0, 200),
+                    ], 'warning', ['service_id', 'error']);
                 }
             }
         } catch (\Throwable $e) {
@@ -931,6 +951,12 @@ class GetBD extends RegistrarModule
                 $this->options['getbd_error'] = mb_substr($message, 0, 250);
                 $this->save_options();
                 $this->save_log('cron.processOrder.failed', $orderId, $message);
+                $this->notifyAdmin('getbd-order-process-failed', [
+                    'domain'     => (string) ($this->options['domain'] ?? ''),
+                    'service_id' => $serviceId,
+                    'order_id'   => $orderId,
+                    'error'      => mb_substr($message, 0, 200),
+                ], 'warning', ['service_id', 'error']);
             }
         }
     }
@@ -1142,7 +1168,6 @@ class GetBD extends RegistrarModule
 <script>
 (function () {
     var VERSION = '1.4.0';
-    console.log('[GetBD] verify assets v' + VERSION);
     var L = {$langJson};
     var DOCS = {$docsJson};
     var STATE = {$stateJson};
@@ -1180,10 +1205,7 @@ class GetBD extends RegistrarModule
     }
 
         function injectListButtons() {
-        console.log('[GetBD Debug] injectListButtons called. Current STATE:', STATE);
         var rows = document.querySelectorAll('article[data-status="pending"][data-name]');
-        console.log('[GetBD Debug] Found pending rows:', rows.length);
-        
         rows.forEach(function (row) {
             var name = (row.getAttribute('data-name') || '').toLowerCase();
             if (!isBdDomain(name)) return;
@@ -1198,16 +1220,10 @@ class GetBD extends RegistrarModule
                 if (m) id = m[1];
             }
             if (!id) return;
-
-            console.log('[GetBD Debug] Processing row ID:', id, 'Domain:', name, 'STATE[id]:', STATE[id]);
-
             if (STATE[id] && STATE[id].submitted) {
-                console.log('[GetBD Debug] Injecting REVIEW CHIP for ID:', id);
                 actions.insertBefore(reviewChip(), actions.firstChild);
                 return;
             }
-
-            console.log('[GetBD Debug] Injecting VERIFY BUTTON for ID:', id);
             var btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn btn-primary btn-sm getbd-verify-btn';
@@ -1392,23 +1408,18 @@ class GetBD extends RegistrarModule
     // this response is not). Falls back to the embedded STATE on failure.
     function loadState(done) {
         var url = addonEndpoint();
-        console.log('[GetBD Debug] loadState called, endpoint:', url);
         if (!url) { 
-            console.log('[GetBD Debug] No addon endpoint found, using embedded STATE');
             done(); 
             return; 
         }
         var fd = new FormData();
         fd.append('operation', 'use_addon_method');
         fd.append('method', 'verify_state');
-        console.log('[GetBD Debug] Sending verify_state request to:', url);
-        
         fetch(url, {
             method: 'POST',
             body: fd,
             headers: { 'X-Requested-With': 'XMLHttpRequest' }
         }).then(function (r) {
-            console.log('[GetBD Debug] Fetch response status:', r.status);
             return r.text().then(function (t) { return t; });
         }).then(function (text) {
             var data = null;
@@ -1440,6 +1451,29 @@ HTML;
     }
 
     /* ==================================================== helpers ===== */
+
+    /**
+     * Admin-panel notification (the bell). Uses the core Admin::notify —
+     * deduplicated while a matching event is still pending, so a persistent
+     * failure (e.g. empty wallet) notifies once, not per cron tick. Never
+     * throws: notification problems must not break the flow.
+     */
+    private function notifyAdmin(string $name, array $data, string $level = 'error', array $dedupeKeys = []): void
+    {
+        try {
+            if (!class_exists('\Admin', false) || !method_exists('\Admin', 'notify')) {
+                $this->save_log('notify.unavailable', $name, 'Admin::notify not found');
+                return;
+            }
+            \Admin::notify($name, $data, $level, [
+                'owner'       => 'GetBD',
+                'dedupe'      => (bool) $dedupeKeys,
+                'dedupe_keys' => $dedupeKeys,
+            ]);
+        } catch (\Throwable $e) {
+            $this->save_log('notify.failed', $name, $e->getMessage());
+        }
+    }
 
     /**
      * Installs/refreshes the Addons bridge (coremio/modules/Addons/GetBDVerify/)
@@ -1523,21 +1557,6 @@ HTML;
         return $response;
     }
 
-    /**
-     * Custom debug logger that writes to a dedicated text file.
-     */
-    private static function debugLog(string $message): void
-    {
-        try {
-            $logFile = __DIR__ . DS . 'debug-' . date('Y-m-d') . '.txt';
-            $timestamp = date('Y-m-d H:i:s');
-            $logEntry = "[{$timestamp}] {$message}\n";
-
-            file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
-        } catch (\Throwable $e) {
-            // Ignore logging errors to prevent breaking the app
-        }
-    }
 }
 
 /* ====================================================== hook wiring ====
