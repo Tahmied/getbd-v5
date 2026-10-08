@@ -97,7 +97,11 @@ sees these), `getbd_last_cron`, `getbd_last_process_retry`.
 ## Admin notifications (the bell)
 
 `Admin::notify()` — the same API WiseCP core crons use. Events (deduplicated while pending,
-so a persistent failure alerts once per distinct error, not per cron tick):
+so a persistent failure alerts once per distinct error, not per cron tick).
+**Critical platform detail: the admin bell only lists events with `owner = 'system'`** —
+a custom owner (e.g. 'GetBD') is created but never displayed. The bell renders
+`data['message']` as the text and auto-links `service_name` + `service_id` to the admin
+service detail page (see `NOTIFICATION_LINKS` in `coremio/helpers/admin.php`).
 
 | Event | Level | Fires when |
 |---|---|---|

@@ -1457,6 +1457,11 @@ HTML;
      * deduplicated while a matching event is still pending, so a persistent
      * failure (e.g. empty wallet) notifies once, not per cron tick. Never
      * throws: notification problems must not break the flow.
+     *
+     * The admin bell ONLY lists events with owner='system' (plus per-admin
+     * user_id-scoped ones) — a custom owner would be created but never shown.
+     * The bell renders data['message'] as the text and auto-links
+     * service_name + service_id to the admin service page.
      */
     private function notifyAdmin(string $name, array $data, string $level = 'error', array $dedupeKeys = []): void
     {
@@ -1465,14 +1470,38 @@ HTML;
                 $this->save_log('notify.unavailable', $name, 'Admin::notify not found');
                 return;
             }
-            \Admin::notify($name, $data, $level, [
-                'owner'       => 'GetBD',
+            $payload = $data;
+            $payload['service_name'] = (string) ($data['domain'] ?? '');
+            if (($payload['message'] ?? '') === '') {
+                $payload['message'] = self::notificationText($name, $data);
+            }
+            \Admin::notify($name, $payload, $level, [
+                'owner'       => 'system',
                 'dedupe'      => (bool) $dedupeKeys,
                 'dedupe_keys' => $dedupeKeys,
             ]);
         } catch (\Throwable $e) {
             $this->save_log('notify.failed', $name, $e->getMessage());
         }
+    }
+
+    private static function notificationText(string $name, array $d): string
+    {
+        $domain = (string) ($d['domain'] ?? 'unknown');
+        $error  = (string) ($d['error'] ?? '');
+        switch ($name) {
+            case 'getbd-domain-activated':
+                return '.bd domain ' . $domain . ' has been activated at the registry (expiry ' . (string) ($d['expiry'] ?? '?') . ').';
+            case 'getbd-order-create-failed':
+                return 'get.bd order creation failed for ' . $domain . ($error !== '' ? ': ' . $error : '');
+            case 'getbd-order-process-failed':
+                return 'get.bd order processing failed for ' . $domain . ($error !== '' ? ': ' . $error : '') . ' — processing retries automatically.';
+            case 'getbd-document-upload-failed':
+                return (string) ($d['failed'] ?? 'Some') . ' document(s) for ' . $domain . ' could not be uploaded to get.bd — attach them via the partner portal (order ' . (string) ($d['order_id'] ?? '?') . ').';
+            case 'getbd-reservation-problem':
+                return 'get.bd reservation problem for ' . $domain . ($error !== '' ? ': ' . $error : '') . ' — the order may need to be recreated.';
+        }
+        return 'GetBD: ' . str_replace(['getbd-', '-'], ['', ' '], $name);
     }
 
     /**
