@@ -30,6 +30,36 @@
         }
 
         /**
+         * Live submission-state for the logged-in client's pending GetBD
+         * domains (method=verify_state). The domains page may be served from
+         * cache, so the modal JS asks for the real state here on every load
+         * instead of trusting server-rendered markup.
+         */
+        public function use_verify_state()
+        {
+            if (!\UserManager::LoginData('member')) {
+                $this->error = 'Please log in to continue.';
+                return false;
+            }
+
+            $registrarDir = MODULE_DIR . 'Registrars' . DS . 'GetBD' . DS;
+            if (!is_file($registrarDir . 'GetBD.php')) {
+                $this->error = 'The GetBD registrar module is not installed.';
+                return false;
+            }
+
+            $module = \Modules::getInstance('Registrars', 'GetBD');
+            if (!$module || !method_exists($module, 'respondPendingState')) {
+                $this->error = 'The GetBD registrar module is unavailable.';
+                return false;
+            }
+
+            $module->respondPendingState('2'); // emits JSON and exits; '2' = bridge revision marker
+
+            return true;
+        }
+
+        /**
          * POST target of the Verify-to-Active modal (method=verify_submit).
          * Returns true on success; the registrar handler emits the JSON
          * response and exits before this returns.
