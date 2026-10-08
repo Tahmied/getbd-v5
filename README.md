@@ -8,6 +8,8 @@ approves them.
 ## Install
 
 1. Copy this `GetBD/` folder into `coremio/modules/registrars/GetBD/` on the WiseCP v5 install.
+   (The `addon-bridge/` subfolder ships with it and is auto-installed into
+   `coremio/modules/Addons/GetBDVerify/` on the first client-area page view — keep it.)
 2. Admin → Modules → Registrars → **GetBD** → enter the **API Key** → Save → Test Connection.
 3. Assign the module to your .bd TLDs (Setup → Domain Pricing → TLD → Registrar = GetBD).
    Leave **transfer** disabled — .bd transfers are not supported.
@@ -39,11 +41,27 @@ checkout ──► service status: inprocess (shows as "pending")
 
 | Piece | Mechanism |
 |---|---|
-| Verify endpoint | `register:routes` hook → `POST /getbd-verify` (session + CSRF `domains` + ownership checked) |
+| Verify endpoint (primary) | **Addons bridge** — the module auto-provisions `coremio/modules/Addons/GetBDVerify/` on every client-area render and settings save. The modal posts `operation=use_addon_method&method=verify_submit` to the addon URL; the addon controller loads the module itself, so this works on every install (no routing-hook timing involved). Ships enabled; appears in the admin Addons list as "GetBD Verify" — do not disable it. |
+| Verify endpoint (fallback) | `register:routes` hook → `POST /getbd-verify` — only used on installs where the hook route actually registers; the JS tries the addon first and falls back. |
 | "Verify to Active" button + modal | `ui:client.domains_list.modals.end` + `ui:client.domain_detail.modals.end` hooks (works on Basic & WStyle) |
 | Activation detection | `PerMinuteCronJob` **and** `action:cron.minute.run` hooks (self-throttled, default every 10 min/service) |
 | Order/process retry | every N hours (default 6) while docs await BTCL approval |
-| Module logs | Admin module log via `save_log` (all API traffic) |
+| Module logs | Admin module log via `save_log` (all API traffic + a `verify.request` line per submission attempt) |
+
+Endpoint transport notes (learned the hard way):
+
+- **Never assume a URL shape.** WiseCP client URLs change with the `rich-url` setting
+  (`/route`, `/index.php?route=`, `/index.php/route`). The modal receives an ordered
+  ENDPOINTS list computed server-side and tries each until it gets module JSON.
+- **Hook-registered routes are not reliable**: on some installs module files load after
+  route collection, so `register:routes` fires too early (result: WiseCP's 404 page).
+  That is why the Addons bridge is the primary transport — `controllers/website/addon.php`
+  loads the addon on request (`Modules::Load("Addons", ...)` in `addon_ctx()`), needing no
+  routing-time registration.
+- Standalone PHP files under `coremio/` are NOT viable: both shipped server configs
+  deny executing PHP there (`.htaccess` + `nginx.conf.example`).
+- The `services/{id}/module-method` client-API bridge is unusable for domains
+  (`managedServiceOf()` whitelists hosting/server/special/software and requires status=active).
 
 ## Service options (users_products.options JSON)
 

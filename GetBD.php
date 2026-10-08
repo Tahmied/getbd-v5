@@ -30,14 +30,26 @@
     {
         private const PROCESS_DOC_GATE_SNIPPET = 'APPROVED documents';
 
+        /** Addons bridge (client-area endpoint) module name + shipped files. */
+        private const BRIDGE_DIR   = 'GetBDVerify';
+        private const BRIDGE_FILES = ['GetBDVerify.php', 'config.php'];
+
         /** Guard so a response is only emitted once (test seam re-throws). */
         protected bool $responded = false;
 
         /* ========================================================== config */
 
-        public function config_fields($settings = []): array
+        /**
+         * Re-provision the Addons bridge whenever settings are saved.
+         */
+        public function controller_settings($extraFields = []): array
         {
-            return [
+            self::ensureAddonBridge();
+            return parent::controller_settings($extraFields);
+        }
+
+        public function config_fields($settings = []): array
+        {            return [
                 'api-key' => [
                     'type'        => 'password',
                     'name'        => $this->lang['fields']['api-key'] ?? 'API Key',
@@ -320,6 +332,10 @@
             if (!headers_sent()) header('Content-Type: application/json; charset=utf-8');
 
             try {
+                // reachability marker: shows up in module logs even when the
+                // request is rejected by an early check
+                $this->save_log('verify.request', (string) ($_SERVER['REQUEST_METHOD'] ?? '-'), 'service=' . (string) ($_POST['service_id'] ?? '-'));
+
                 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
                     $this->respondJson('error', 'Method not allowed.');
                 }
@@ -812,6 +828,46 @@
         {
             if (\defined('CRON')) return ''; // no client UI inside cron context
 
+            self::ensureAddonBridge();
+
+            // Endpoint candidates, tried in order by the modal's JS.
+            //
+            // 1. Addons bridge (guaranteed): the website addon controller
+            //    loads the addon module itself on request, so it works on
+            //    every install regardless of routing/hook timing.
+            // 2. register:routes website route — only exists on installs
+            //    where module files load before route collection.
+            //
+            // Client URL shapes vary with the "rich-url" setting (/route,
+            // /index.php?route=, /index.php/route) and installs may live in a
+            // subdirectory — LinkGenerator handles that per route key.
+            $endpoints = [];
+
+            try {
+                $addonUrl = (string) \LinkGenerator::client('addon/' . self::BRIDGE_DIR);
+                if ($addonUrl !== '' && str_contains($addonUrl, self::BRIDGE_DIR)) {
+                    $endpoints[] = ['url' => $addonUrl, 'via' => 'addon'];
+                }
+            } catch (\Throwable $e) {
+                // LinkGenerator unavailable — the route candidates below still apply
+            }
+
+            try {
+                $routeUrl = (string) \LinkGenerator::client('getbd-verify');
+                if ($routeUrl !== '' && str_contains($routeUrl, 'getbd-verify')) {
+                    $endpoints[] = ['url' => $routeUrl, 'via' => 'route'];
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+
+            $rich   = (string) (\Config::get('general/rich-url') ?: '');
+            $add    = (!$rich || $rich === 'on') ? '/' : ($rich === 'off2' ? '/index.php?route=' : '/index.php/');
+            $manual = rtrim(\Utility::AppAdress(), '/') . $add . 'getbd-verify';
+            if (!in_array($manual, array_column($endpoints, 'url'), true)) {
+                $endpoints[] = ['url' => $manual, 'via' => 'route'];
+            }
+
             $endpoint = rtrim(\Utility::AppAdress(), '/') . '/getbd-verify';
             $csrf     = \Validation::get_csrf_token('domains', true);
             $lang     = [
@@ -845,9 +901,9 @@
             ];
 
             $jsJson = fn($v): string => json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            $docsJson     = $jsJson(self::docMatrix());
-            $langJson     = $jsJson($lang);
-            $endpointJson = $jsJson($endpoint);
+            $docsJson      = $jsJson(self::docMatrix());
+            $langJson      = $jsJson($lang);
+            $endpointsJson = $jsJson($endpoints ?: [['url' => rtrim(\Utility::AppAdress(), '/') . '/getbd-verify', 'via' => 'route']]);
 
             return <<<HTML
 <div class="modal fade" id="getbdVerifyModal" tabindex="-1" aria-hidden="true">
@@ -896,7 +952,7 @@
 (function () {
     var L = {$langJson};
     var DOCS = {$docsJson};
-    var ENDPOINT = {$endpointJson};
+    var ENDPOINTS = {$endpointsJson};
 
     var BD_TLDS = ['bd','com.bd','net.bd','org.bd','edu.bd','gov.bd','ac.bd','mil.bd','info.bd','tv.bd','co.bd','ai.bd','sch.bd','id.bd','biz.bd'];
 
@@ -1015,35 +1071,67 @@
         if (!/^\\+8801[3-9]\\d{8}$/.test(phone)) return show(L.errPhone);
         form.querySelector('input[name="contact_number"]').value = phone;
 
-        var fd = new FormData(form);
         btn.disabled = true;
         var original = btn.innerHTML;
         btn.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>' + L.submitting;
 
-        fetch(ENDPOINT, {
-            method: 'POST',
-            body: fd,
-            headers: { 'X-Requested-With': 'XMLHttpRequest' }
-        }).then(function (r) { return r.json(); }).then(function (data) {
-            if (data && data.status === 'success') {
-                modalEl.querySelector('.modal-body').innerHTML =
-                    '<div class="text-center py-4"><i class="bi bi-patch-check-fill text-success" style="font-size:2.5rem"></i>' +
-                    '<p class="mt-3 mb-0">' + (data.message || L.done) + '</p></div>';
-                modalEl.querySelector('.modal-footer').innerHTML = '';
-                setTimeout(function () { window.location.reload(); }, 2500);
-            } else {
-                show((data && data.message) || L.failed);
-            }
-        }).catch(function () {
-            show(L.failed);
-        }).finally(function () {
+        var lastProblem = '';
+
+        function restore() {
             btn.disabled = false;
             btn.innerHTML = original;
-        });
+        }
+
+        function success(data) {
+            modalEl.querySelector('.modal-body').innerHTML =
+                '<div class="text-center py-4"><i class="bi bi-patch-check-fill text-success" style="font-size:2.5rem"></i>' +
+                '<p class="mt-3 mb-0">' + (data.message || L.done) + '</p></div>';
+            modalEl.querySelector('.modal-footer').innerHTML = '';
+            setTimeout(function () { window.location.reload(); }, 2500);
+        }
+
+        function attempt(i) {
+            if (i >= ENDPOINTS.length) {
+                restore();
+                show(lastProblem || L.failed);
+                return;
+            }
+            var ep = ENDPOINTS[i] || {};
+            var fd = new FormData(form);
+            if (ep.via === 'addon') {
+                fd.append('operation', 'use_addon_method');
+                fd.append('method', 'verify_submit');
+            }
+            fetch(ep.url, {
+                method: 'POST',
+                body: fd,
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            }).then(function (r) {
+                return r.text().then(function (t) { return { httpStatus: r.status, text: t }; });
+            }).then(function (res) {
+                var data = null;
+                try { data = JSON.parse(res.text); } catch (e) {}
+                if (data && (data.status === 'success' || data.status === 'error')) {
+                    if (data.status === 'success') { success(data); return; }
+                    restore();
+                    show(data.message || L.failed);
+                    return;
+                }
+                lastProblem = L.failed + ' unexpected server response (HTTP ' + res.httpStatus +
+                    (res.text ? ': ' + String(res.text).replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').substring(0, 140) : '') + ')';
+                attempt(i + 1);
+            }).catch(function (err) {
+                lastProblem = L.failed + ' request failed (' + (err && err.message ? err.message : 'network error') + ')';
+                attempt(i + 1);
+            });
+        }
+
+        attempt(0);
 
         function show(msg) {
-            alertBox.textContent = L.failed + ' ' + msg;
+            alertBox.textContent = msg;
             alertBox.classList.remove('d-none');
+            try { alertBox.scrollIntoView({ block: 'nearest' }); } catch (e) {}
         }
     }
 
@@ -1065,6 +1153,34 @@ HTML;
         }
 
         /* ==================================================== helpers ===== */
+
+        /**
+         * Installs/refreshes the Addons bridge (coremio/modules/Addons/GetBDVerify/)
+         * that hosts the client-area verify endpoint. Runs from client-area
+         * renders and settings saves, so no manual step is ever needed.
+         */
+        private static function ensureAddonBridge(): void
+        {
+            try {
+                $source = MODULE_DIR . 'Registrars' . DS . 'GetBD' . DS . 'addon-bridge' . DS;
+                if (!is_dir($source)) return;
+
+                $target = MODULE_DIR . 'Addons' . DS . self::BRIDGE_DIR . DS;
+
+                foreach (self::BRIDGE_FILES as $file) {
+                    $srcPath = $source . $file;
+                    if (!is_file($srcPath)) continue;
+
+                    $src = (string) file_get_contents($srcPath);
+                    if (is_file($target . $file) && (string) file_get_contents($target . $file) === $src) continue;
+
+                    if (!is_dir($target)) @mkdir($target, 0755, true);
+                    \FileManager::file_write($target . $file, $src);
+                }
+            } catch (\Throwable $e) {
+                \Modules::save_log('Registrars', 'GetBD', 'bridge.provision', '', $e->getMessage());
+            }
+        }
 
         private function asciiDomain(string $domain): string|false
         {
