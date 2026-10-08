@@ -30,6 +30,63 @@
     {
         private const PROCESS_DOC_GATE_SNIPPET = 'APPROVED documents';
 
+        /**
+         * File types accepted by get.bd /documents/upload (images except SVG,
+         * PDF, DOC/DOCX — max 5 MB, content inspected against declared type).
+         */
+        private const DOC_EXTENSIONS = ['jpg', 'jpeg', 'png', 'bmp', 'webp', 'gif', 'pdf', 'doc', 'docx'];
+
+        /**
+         * Per-extension document requirements (official BTCL/get.bd table).
+         * get.bd's documentType enum is NID | TRADE_LICENSE | PASSPORT | OTHER
+         * (one document per type per order), so:
+         *   .bd / .id.bd              -> NID required, passport optional
+         *   .com.bd / .co.bd          -> NID + trade licence (both required)
+         *   .net/.info/.ai/.tv/.বাংলা -> NID required, trade licence optional
+         *   .org.bd                   -> NID + registration certificate (OTHER)
+         *   .edu.bd                   -> NID + EIIN/UGC approval (OTHER)
+         *   .sch.bd                   -> NID + EIIN certificate (OTHER)
+         */
+        public static function docSlots(string $tld): array
+        {
+            $tld = strtolower(trim($tld, '.'));
+            if ($tld === '') $tld = 'bd';
+            if (str_starts_with($tld, 'xn--')) {
+                $utf8 = idn_to_utf8($tld, 0, INTL_IDNA_VARIANT_UTS46);
+                if (is_string($utf8) && $utf8 !== '') $tld = strtolower($utf8);
+            }
+
+            $nid      = ['input' => 'doc_nid',       'documentType' => 'NID',    'required' => true,  'label' => 'NID document'];
+            $passport = ['input' => 'doc_passport',  'documentType' => 'PASSPORT', 'required' => false, 'label' => 'Passport copy (optional)'];
+
+            switch ($tld) {
+                case 'com.bd':
+                case 'co.bd':
+                    return [$nid, ['input' => 'doc_secondary', 'documentType' => 'TRADE_LICENSE', 'required' => true, 'label' => 'Trade licence document']];
+
+                case 'org.bd':
+                    return [$nid, ['input' => 'doc_secondary', 'documentType' => 'OTHER', 'required' => true, 'label' => 'Registration certificate']];
+
+                case 'edu.bd':
+                    return [$nid, ['input' => 'doc_secondary', 'documentType' => 'OTHER', 'required' => true, 'label' => 'EIIN or UGC approval document']];
+
+                case 'sch.bd':
+                    return [$nid, ['input' => 'doc_secondary', 'documentType' => 'OTHER', 'required' => true, 'label' => 'EIIN certificate']];
+
+                case 'bd':
+                case 'id.bd':
+                    return [$nid, $passport]; // NID or passport
+
+                case 'net.bd':
+                case 'info.bd':
+                case 'ai.bd':
+                case 'tv.bd':
+                case 'বাংলা':
+                default: // safe default for anything unknown
+                    return [$nid, ['input' => 'doc_secondary', 'documentType' => 'TRADE_LICENSE', 'required' => false, 'label' => 'Trade licence document (optional)']];
+            }
+        }
+
         /** Addons bridge (client-area endpoint) module name + shipped files. */
         private const BRIDGE_DIR   = 'GetBDVerify';
         private const BRIDGE_FILES = ['GetBDVerify.php', 'config.php'];
@@ -424,6 +481,9 @@
                 if ($v2['country'] === '') {
                     $v2['country'] = strtoupper(substr((string) ($settings['default-country'] ?? 'BD'), 0, 2));
                 }
+                if ($v2['postcode'] !== '' && (!preg_match('/^\d{1,9}$/', $v2['postcode']) || (int) $v2['postcode'] < 1)) {
+                    $this->respondJson('error', $this->lang['verify']['err-postcode'] ?? 'Postcode must be digits only (e.g. 9100).');
+                }
 
                 $nameServers = [];
                 for ($i = 1; $i <= 3; $i++) {
@@ -438,11 +498,11 @@
                 /* ---- receive + store uploaded documents ---- */
 
                 $stored = $this->storeVerifyDocuments($serviceId);
-                if (count($stored['files']) < 2) {
-                    $this->respondJson('error', $this->lang['verify']['err-files'] ?? 'Please attach at least 2 document files.');
-                }
                 if ($stored['error'] !== '') {
                     $this->respondJson('error', $stored['error']);
+                }
+                if (!$stored['files']) {
+                    $this->respondJson('error', $this->lang['verify']['err-files'] ?? 'Please attach the required documents.');
                 }
 
                 /* ---- mark as submitting (guards double-submits) ---- */
@@ -482,22 +542,28 @@
                     if ($value !== '') $payload[$field] = $value;
                 }
 
+                // derived from the payload: identical resubmissions replay the
+                // same order; a corrected submission (different payload) gets a
+                // different key instead of an idempotency conflict
+                $idempotencyKey = 'wisecp-' . $serviceId . '-' . substr(md5(\Utility::jencode($payload)), 0, 16);
+
                 try {
-                    $orderResponse = $this->api->createOrder($payload, 'wisecp-' . $serviceId);
+                    $orderResponse = $this->api->createOrder($payload, $idempotencyKey);
                 } catch (\Throwable $e) {
                     $this->options['getbd_state'] = 'awaiting_verification';
                     $this->options['getbd_error'] = mb_substr($e->getMessage(), 0, 250);
                     $this->save_options();
                     $this->save_log('verify.createOrder.failed', \Utility::jencode(['service' => $serviceId]), $e->getMessage());
-                    $this->respondJson('error', $this->lang['verify']['err-order'] ?? 'The domain could not be reserved. Please try again or contact support.');
+                    $this->respondJson('error', trim(($this->lang['verify']['err-order'] ?? 'The domain could not be reserved. Please try again or contact support.') . ': ' . $e->getMessage(), ': '));
                 }
 
                 $orderId = (string) ($orderResponse['data']['id'] ?? '');
                 if (empty($orderResponse['success']) || $orderId === '') {
+                    $apiMessage = (string) ($orderResponse['message'] ?? 'Order creation failed.');
                     $this->options['getbd_state'] = 'awaiting_verification';
-                    $this->options['getbd_error'] = mb_substr((string) ($orderResponse['message'] ?? 'Order creation failed.'), 0, 250);
+                    $this->options['getbd_error'] = mb_substr($apiMessage, 0, 250);
                     $this->save_options();
-                    $this->respondJson('error', $this->lang['verify']['err-order'] ?? 'The domain could not be reserved. Please try again or contact support.');
+                    $this->respondJson('error', trim(($this->lang['verify']['err-order'] ?? 'The domain could not be reserved. Please try again or contact support.') . ': ' . $apiMessage, ': '));
                 }
 
                 /* ---- order exists: persist + upload docs + first process ---- */
@@ -517,10 +583,10 @@
                 $uploadFailures = 0;
                 foreach ($stored['files'] as $file) {
                     try {
-                        $this->api->uploadDocument($orderId, (string) $file['path'], (string) $file['name']);
+                        $this->api->uploadDocument($orderId, (string) $file['type'], (string) $file['path'], (string) $file['name']);
                     } catch (\Throwable $e) {
                         $uploadFailures++;
-                        $this->save_log('verify.uploadDocument.failed', \Utility::jencode(['service' => $serviceId, 'file' => $file['name']]), $e->getMessage());
+                        $this->save_log('verify.uploadDocument.failed', \Utility::jencode(['service' => $serviceId, 'type' => $file['type'], 'file' => $file['name']]), $e->getMessage());
                     }
                 }
                 if ($uploadFailures) {
@@ -567,18 +633,11 @@
         {
             $result = ['files' => [], 'error' => ''];
 
-            $raw = $_FILES['doc_file'] ?? null;
-            if (!is_array($raw) || !isset($raw['name']) || !is_array($raw['name'])) {
-                return $result;
-            }
+            // per-extension slots (see docSlots): one file per get.bd
+            // documentType, required ones enforced here
+            $definitions = self::docSlots((string) ($this->options['tld'] ?? ''));
 
-            $count = count($raw['name']);
-            if ($count > 4) {
-                $result['error'] = $this->lang['verify']['err-files-count'] ?? 'A maximum of 4 document files is allowed.';
-                return $result;
-            }
-
-            $allowed = explode(',', 'pdf,jpg,jpeg,png,gif,doc,docx,txt,zip');
+            $allowed = self::DOC_EXTENSIONS;
             $folder  = rtrim((string) ROOT_DIR, "\\/") . DS . 'resources' . DS . 'uploads' . DS . 'documents' . DS . 'getbd' . DS . $serviceId . DS;
             if (!is_dir($folder)) @mkdir($folder, 0755, true);
             if (!is_dir($folder)) {
@@ -586,28 +645,36 @@
                 return $result;
             }
 
-            for ($i = 0; $i < $count; $i++) {
-                if ((int) ($raw['error'][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) continue;
-                if ((int) ($raw['error'][$i] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) {
-                    $result['error'] = $this->lang['verify']['err-file-upload'] ?? 'A document could not be uploaded. Please try again.';
+            foreach ($definitions as $def) {
+                $raw = $_FILES[$def['input']] ?? null;
+                if (!is_array($raw) || ($raw['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE || ($raw['name'] ?? '') === '') {
+                    if (!empty($def['required'])) {
+                        $result['error'] = $this->lang['verify']['err-files'] ?? 'Please attach the required documents.'
+                            . ' (' . $def['label'] . ')';
+                        return $result;
+                    }
+                    continue;
+                }
+                if ((int) ($raw['error'] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) {
+                    $result['error'] = $def['label'] . ': ' . ($this->lang['verify']['err-file-upload'] ?? 'the file could not be uploaded. Please try again.');
                     return $result;
                 }
 
                 $single = [
-                    'name'     => $raw['name'][$i],
-                    'type'     => $raw['type'][$i] ?? '',
-                    'tmp_name' => $raw['tmp_name'][$i] ?? '',
-                    'error'    => $raw['error'][$i],
-                    'size'     => $raw['size'][$i] ?? 0,
+                    'name'     => (string) ($raw['name'] ?? ''),
+                    'type'     => (string) ($raw['type'] ?? ''),
+                    'tmp_name' => (string) ($raw['tmp_name'] ?? ''),
+                    'error'    => (int) ($raw['error'] ?? UPLOAD_ERR_OK),
+                    'size'     => (int) ($raw['size'] ?? 0),
                 ];
 
-                $ext = strtolower(pathinfo((string) $single['name'], PATHINFO_EXTENSION));
+                $ext = strtolower(pathinfo($single['name'], PATHINFO_EXTENSION));
                 if ($ext === '' || !in_array($ext, $allowed, true) || \Uploads::is_executable_ext($ext)) {
-                    $result['error'] = $this->lang['verify']['err-file-type'] ?? 'Document type is not allowed (pdf, jpg, png, doc, docx, txt, zip).';
+                    $result['error'] = $this->lang['verify']['err-file-type'] ?? 'Document type is not allowed. Accepted: images, PDF, DOC, DOCX.';
                     return $result;
                 }
-                if ((int) $single['size'] <= 0 || (int) $single['size'] > 5 * 1024 * 1024) {
-                    $result['error'] = $this->lang['verify']['err-file-size'] ?? 'Each document must be between 0 and 5 MB.';
+                if ($single['size'] <= 0 || $single['size'] > 5 * 1024 * 1024) {
+                    $result['error'] = $this->lang['verify']['err-file-size'] ?? 'Each document must be at most 5 MB.';
                     return $result;
                 }
 
@@ -633,6 +700,7 @@
                 }
 
                 $result['files'][] = [
+                    'type' => $def['documentType'],
                     'name' => (string) ($op['file_name'] ?? $single['name']),
                     'path' => rtrim($folder, '\\/') . DS . (string) ($op['name'] ?? ''),
                     'size' => (int) ($op['size'] ?? 0),
@@ -762,60 +830,22 @@
 
         /* ================================================== client UI ==== */
 
-        /** Per-TLD required document matrix (mirror of the WHMCS reference). */
+        /** Per-extension document summary shown in the modal (official table). */
         public static function docMatrix(): array
         {
             return [
-                'com.bd' => [
-                    'Trade License OR Certificate of Incorporation / Business Registration',
-                    'Authorization letter (if applicant is not owner)',
-                    'TIN certificate (optional but recommended)',
-                ],
-                'net.bd' => [
-                    'Trade License OR Certificate of Incorporation / Business Registration',
-                    'Authorization letter (if applicant is not owner)',
-                    'TIN certificate (optional but recommended)',
-                ],
-                'org.bd' => [
-                    'NGO Affairs Bureau certificate',
-                    'Trust deed',
-                    'Association registration certificate',
-                ],
-                'edu.bd' => [
-                    'Government approval letter',
-                    'Ministry of Education recognition',
-                    'Education Board affiliation certificate',
-                    'UGC approval',
-                    'Institution registration certificate',
-                ],
-                'ac.bd' => [
-                    'Government approval letter',
-                    'Ministry of Education recognition',
-                    'Education Board affiliation certificate',
-                    'UGC approval',
-                    'Institution registration certificate',
-                ],
-                'gov.bd' => [
-                    'Official request letter',
-                    'Ministry or departmental approval',
-                    'Government order or gazette (if applicable)',
-                ],
-                'mil.bd' => [
-                    'Official authorization from Bangladesh Army / Navy / Air Force',
-                ],
-                'info.bd' => [
-                    'Basic identity or organization registration documents',
-                    'Explanation of intended information usage (if required)',
-                ],
-                'id.bd' => [
-                    'No specific documents required (NID verification only)',
-                ],
-                'biz.bd' => [
-                    'Basic identity or business registration documents',
-                ],
-                'bd' => [
-                    'NID verification (additional documents may be requested case-by-case)',
-                ],
+                'bd'      => ['NID or passport'],
+                'com.bd'  => ['Trade licence', 'NID'],
+                'net.bd'  => ['NID or trade licence'],
+                'org.bd'  => ['Registration certificate'],
+                'edu.bd'  => ['EIIN or UGC approval'],
+                'info.bd' => ['NID or trade licence'],
+                'id.bd'   => ['NID or passport'],
+                'sch.bd'  => ['EIIN certificate'],
+                'co.bd'   => ['Trade licence + NID'],
+                'ai.bd'   => ['NID or trade licence'],
+                'tv.bd'   => ['NID or trade licence'],
+                'বাংলা'    => ['NID or trade licence'],
             ];
         }
 
@@ -829,6 +859,31 @@
             if (\defined('CRON')) return ''; // no client UI inside cron context
 
             self::ensureAddonBridge();
+
+            // Per-service submission state for the logged-in client: which
+            // pending domains already have a get.bd order (docs submitted).
+            // The modal JS turns the button into a review chip for these.
+            $stateMap = [];
+            try {
+                $member = \UserManager::LoginData('member');
+                if ($member && !empty($member['id'])) {
+                    $q = \WDB::select('id, status, options')->from('users_products');
+                    $q->where('type', '=', 'domain', '&&');
+                    $q->where('module', '=', 'GetBD', '&&');
+                    $q->where('owner_id', '=', (int) $member['id']);
+                    $rows = $q->build() ? $q->getAssoc() : [];
+                    foreach ((array) $rows as $row) {
+                        if (!in_array((string) ($row['status'] ?? ''), ['waiting', 'inprocess'], true)) continue;
+                        $opts = \Utility::jdecode((string) ($row['options'] ?? ''), true);
+                        if (!is_array($opts)) continue;
+                        $stateMap[(string) (int) $row['id']] = [
+                            'submitted' => !empty($opts['getbd_order_id']) || in_array((string) ($opts['getbd_state'] ?? ''), ['submitting', 'submitted', 'active'], true),
+                        ];
+                    }
+                }
+            } catch (\Throwable $e) {
+                $stateMap = [];
+            }
 
             // Endpoint candidates, tried in order by the modal's JS.
             //
@@ -876,9 +931,10 @@
                 'button'     => 'Verify to Active',
                 'review'     => 'Under BTCL review',
                 'documents'  => 'Required documents',
-                'doc1'       => 'Document 1 (required)',
-                'doc2'       => 'Document 2 (required)',
-                'docMore'    => 'Additional document (optional)',
+                'docNid'     => 'NID document (required)',
+                'docSecondary' => 'Supporting document (required)',
+                'docTrade'   => 'Trade license / business registration (required)',
+                'docPassport' => 'Passport copy (optional)',
                 'fullName'   => 'Registrant full name',
                 'nid'        => 'NID number (10 / 13 / 17 digits)',
                 'email'      => 'Email address',
@@ -893,7 +949,8 @@
                 'submit'     => 'Submit documents',
                 'submitting' => 'Submitting…',
                 'note'       => 'BTCL reviews the documents manually; the domain activates automatically after approval. Orders reserve the domain for 7 days.',
-                'errFiles'   => 'Please attach at least 2 document files.',
+                'errFiles'   => 'Please attach the required documents.',
+                'errPostcode' => 'Postcode must be digits only (e.g. 9100).',
                 'errPhone'   => 'Contact number must look like +8801XXXXXXXXX.',
                 'errNid'     => 'NID number must be 10, 13, or 17 digits.',
                 'done'       => 'Documents submitted — your domain is under BTCL review.',
@@ -901,7 +958,21 @@
             ];
 
             $jsJson = fn($v): string => json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            $docsJson      = $jsJson(self::docMatrix());
+            $docDefs = [];
+            foreach (array_merge(self::docMatrix(), array_fill_keys(['ac.bd', 'gov.bd', 'mil.bd', 'biz.bd'], [])) as $tld => $items) {
+                $slots = self::docSlots($tld);
+                $secondary = null;
+                $passport = false;
+                foreach ($slots as $slot) {
+                    if ($slot['input'] === 'doc_secondary') {
+                        $secondary = ['type' => $slot['documentType'], 'label' => $slot['label'], 'required' => (bool) $slot['required']];
+                    }
+                    if ($slot['input'] === 'doc_passport') $passport = true;
+                }
+                $docDefs[$tld] = ['checklist' => $items, 'secondary' => $secondary, 'passport' => $passport];
+            }
+            $docsJson      = $jsJson($docDefs);
+            $stateJson     = $jsJson($stateMap ?: new \stdClass());
             $langJson      = $jsJson($lang);
             $endpointsJson = $jsJson($endpoints ?: [['url' => rtrim(\Utility::AppAdress(), '/') . '/getbd-verify', 'via' => 'route']]);
 
@@ -931,9 +1002,9 @@
                         <div class="col-md-4"><label class="form-label">{$lang['state']}</label><input type="text" class="form-control" name="post_state" maxlength="60"></div>
                         <div class="col-md-4"><label class="form-label">{$lang['postcode']}</label><input type="text" class="form-control" name="postcode" maxlength="12"></div>
                         <div class="col-12"><label class="form-label fw-semibold">{$lang['documents']}</label><div id="getbd-doc-list" class="small text-muted mb-2"></div></div>
-                        <div class="col-md-6"><label class="form-label">{$lang['doc1']}</label><input type="file" class="form-control" name="doc_file[]" required accept=".pdf,.jpg,.jpeg,.png,.gif,.doc,.docx,.txt,.zip"></div>
-                        <div class="col-md-6"><label class="form-label">{$lang['doc2']}</label><input type="file" class="form-control" name="doc_file[]" required accept=".pdf,.jpg,.jpeg,.png,.gif,.doc,.docx,.txt,.zip"></div>
-                        <div class="col-12"><label class="form-label">{$lang['docMore']}</label><input type="file" class="form-control" name="doc_file[]" accept=".pdf,.jpg,.jpeg,.png,.gif,.doc,.docx,.txt,.zip"></div>
+                        <div class="col-md-6"><label class="form-label">{$lang['docNid']}</label><input type="file" class="form-control" name="doc_nid" required accept=".jpg,.jpeg,.png,.bmp,.webp,.gif,.pdf,.doc,.docx"></div>
+                        <div class="col-md-6 d-none" id="getbd-sec-row"><label class="form-label"><span id="getbd-lbl-sec"></span></label><input type="file" class="form-control" name="doc_secondary" accept=".jpg,.jpeg,.png,.bmp,.webp,.gif,.pdf,.doc,.docx"></div>
+                        <div class="col-12 d-none" id="getbd-pass-row"><label class="form-label"><span id="getbd-lbl-pass"></span></label><input type="file" class="form-control" name="doc_passport" accept=".jpg,.jpeg,.png,.bmp,.webp,.gif,.pdf,.doc,.docx"></div>
                         <div class="col-md-4"><label class="form-label">{$lang['ns']}</label><input type="text" class="form-control" name="ns1" placeholder="ns1.example.com"></div>
                         <div class="col-md-4"><label class="form-label">&nbsp;</label><input type="text" class="form-control" name="ns2" placeholder="ns2.example.com"></div>
                         <div class="col-md-4"><label class="form-label">&nbsp;</label><input type="text" class="form-control" name="ns3" placeholder="ns3.example.com"></div>
@@ -952,9 +1023,13 @@
 (function () {
     var L = {$langJson};
     var DOCS = {$docsJson};
+    var STATE = {$stateJson};
     var ENDPOINTS = {$endpointsJson};
 
+
+
     var BD_TLDS = ['bd','com.bd','net.bd','org.bd','edu.bd','gov.bd','ac.bd','mil.bd','info.bd','tv.bd','co.bd','ai.bd','sch.bd','id.bd','biz.bd'];
+    var currentDef = null;
 
     function isBdDomain(name) {
         name = (name || '').toLowerCase().trim();
@@ -973,6 +1048,15 @@
         return n > 2 ? labels[n - 2] + '.' + labels[n - 1] : labels[n - 1];
     }
 
+    function reviewChip() {
+        var chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'btn btn-soft btn-sm';
+        chip.disabled = true;
+        chip.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>' + L.review;
+        return chip;
+    }
+
     function injectListButtons() {
         var rows = document.querySelectorAll('article[data-status="pending"][data-name]');
         rows.forEach(function (row) {
@@ -988,6 +1072,11 @@
                 if (m) id = m[1];
             }
             if (!id) return;
+
+            if (STATE[id] && STATE[id].submitted) {
+                actions.insertBefore(reviewChip(), actions.firstChild);
+                return;
+            }
 
             var btn = document.createElement('button');
             btn.type = 'button';
@@ -1011,14 +1100,20 @@
         var id = ctx.getAttribute('data-id');
         var name = titleEl.textContent.toLowerCase().trim();
 
-        var btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'btn btn-primary btn-sm mt-2 getbd-verify-btn';
-        btn.innerHTML = '<i class="bi bi-patch-check me-1"></i>' + L.button;
-        btn.addEventListener('click', function () { openModal(id, name); });
+        var el;
+        if (STATE[id] && STATE[id].submitted) {
+            el = reviewChip();
+            el.className = 'btn btn-soft btn-sm mt-2';
+        } else {
+            el = document.createElement('button');
+            el.type = 'button';
+            el.className = 'btn btn-primary btn-sm mt-2 getbd-verify-btn';
+            el.innerHTML = '<i class="bi bi-patch-check me-1"></i>' + L.button;
+            el.addEventListener('click', function () { openModal(id, name); });
+        }
 
         var host = document.querySelector('.sd-hero-id') || ctx;
-        host.appendChild(btn);
+        host.appendChild(el);
     }
 
     function openModal(serviceId, domain) {
@@ -1031,7 +1126,9 @@
 
         var docList = modalEl.querySelector('#getbd-doc-list');
         var tld = tldOf(domain);
-        var items = DOCS[tld] || DOCS['bd'] || [];
+        var def = DOCS[tld] || DOCS['bd'] || { checklist: [], secondary: null, passport: false };
+        currentDef = def;
+        var items = def.checklist || [];
         docList.innerHTML = '';
         items.forEach(function (item) {
             var div = document.createElement('div');
@@ -1042,6 +1139,26 @@
         var form = modalEl.querySelector('#getbd-verify-form');
         form.reset();
         modalEl.querySelector('input[name="country"]').value = '';
+
+        var secRow = modalEl.querySelector('#getbd-sec-row');
+        var passRow = modalEl.querySelector('#getbd-pass-row');
+        var secInput = modalEl.querySelector('input[name="doc_secondary"]');
+        if (def.secondary) {
+            secRow.classList.remove('d-none');
+            modalEl.querySelector('#getbd-lbl-sec').textContent = def.secondary.label + (def.secondary.required ? '' : ' (optional)');
+            secInput.required = !!def.secondary.required;
+        } else {
+            secRow.classList.add('d-none');
+            secInput.required = false;
+            secInput.value = '';
+        }
+        if (def.passport) {
+            passRow.classList.remove('d-none');
+            modalEl.querySelector('#getbd-lbl-pass').textContent = 'Passport copy (optional)';
+        } else {
+            passRow.classList.add('d-none');
+            modalEl.querySelector('input[name="doc_passport"]').value = '';
+        }
 
         var modal = bootstrap.Modal.getOrCreateInstance(modalEl);
         modal.show();
@@ -1058,12 +1175,11 @@
         var nid = form.querySelector('input[name="nid"]').value.replace(/\\D/g, '');
         if ([10, 13, 17].indexOf(nid.length) === -1) { return show(L.errNid); }
 
-        var files = form.querySelectorAll('input[type="file"]');
-        var fileCount = 0;
-        files.forEach(function (input) {
-            fileCount += input.files.length;
-        });
-        if (fileCount < 2) return show(L.errFiles);
+        if (!form.querySelector('input[name="doc_nid"]').files.length ||
+            (currentDef && currentDef.secondary && currentDef.secondary.required &&
+             !form.querySelector('input[name="doc_secondary"]').files.length)) {
+            return show(L.errFiles);
+        }
 
         var phone = form.querySelector('input[name="contact_number"]').value.replace(/[\\s\\-()]/g, '');
         if (phone.indexOf('+') !== 0 && phone.indexOf('880') === 0) phone = '+' + phone;

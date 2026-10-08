@@ -70,6 +70,30 @@ Endpoint transport notes (learned the hard way):
 (registrar-side issues: wallet, reservation expired, upload failures — client never
 sees these), `getbd_last_cron`, `getbd_last_process_retry`.
 
+## Documents & get.bd contract notes
+
+- The modal collects documents **per the official per-extension requirements table**
+  (get.bd enum: NID | TRADE_LICENSE | PASSPORT | OTHER — one document per type per order):
+
+  | Extension | NID | Second document |
+  |---|---|---|
+  | .bd / .id.bd | required | Passport (optional alternative) |
+  | .com.bd / .co.bd | required | Trade licence (TRADE_LICENSE, required) |
+  | .net/.info/.ai/.tv.bd / .বাংলা | required | Trade licence (optional) |
+  | .org.bd | required | Registration certificate (OTHER, required) |
+  | .edu.bd | required | EIIN or UGC approval (OTHER, required) |
+  | .sch.bd | required | EIIN certificate (OTHER, required) |
+
+  Accepted files: images except SVG, PDF, DOC/DOCX, max 5 MB (validated module-side;
+  get.bd also inspects real file content).
+- Each file uploads to `POST /documents/upload` with `orderId`, `documentType`, `file`.
+  A `409` (that type already PENDING/APPROVED) is logged as a non-fatal upload failure.
+- The create-order `Idempotency-Key` is `wisecp-{serviceId}-{md5(payload)}`: identical
+  resubmissions replay the same order; a corrected submission (different payload) gets
+  a new key instead of an idempotency conflict.
+- Field-validation failures from get.bd (its `errorMessages[]`) are surfaced to the
+  client and logged, so e.g. a bad postcode is fixable without support.
+
 ## Admin notes
 
 - If `getbd_error` mentions the **wallet** or **RESERVATION_EXPIRED**, fix it in the

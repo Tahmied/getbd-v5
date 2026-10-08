@@ -81,13 +81,15 @@
         }
 
         /**
-         * Upload a document against an order. NOTE: the exact multipart
-         * contract of this endpoint is not fully documented in the wild; we
-         * send the order reference plus the file. Callers MUST treat failures
-         * as non-fatal (documents can still be uploaded via the partner
-         * portal) — the registry approval gate is what actually matters.
+         * Upload a document against an order (multipart/form-data).
+         *
+         * Contract (official get.bd docs): fields orderId (ULID), documentType
+         * (enum NID|TRADE_LICENSE|PASSPORT|OTHER — one document per type per
+         * order; a second upload of a PENDING/APPROVED type returns 409, and
+         * uploading over a REJECTED one replaces it), file (images except SVG,
+         * PDF, DOC/DOCX — content inspected against declared type, max 5 MB).
          */
-        public function uploadDocument(string $orderId, string $filePath, string $originalName): array
+        public function uploadDocument(string $orderId, string $documentType, string $filePath, string $originalName): array
         {
             if (!is_file($filePath)) {
                 throw new GetBDApiException('Document file not found: ' . $filePath);
@@ -95,8 +97,9 @@
 
             return $this->request('POST', '/documents/upload', [
                 'multipart' => [
-                    ['name' => 'orderId', 'contents' => $orderId],
-                    ['name' => 'file', 'contents' => fopen($filePath, 'rb'), 'filename' => $originalName],
+                    ['name' => 'orderId',      'contents' => $orderId],
+                    ['name' => 'documentType', 'contents' => $documentType],
+                    ['name' => 'file',         'contents' => fopen($filePath, 'rb'), 'filename' => $originalName],
                 ],
             ]);
         }
@@ -197,6 +200,19 @@
 
             if ($status >= 400) {
                 $message = (string) ($decoded['message'] ?? $decoded['error'] ?? ('HTTP ' . $status));
+                // surface field-level validation details (errorMessages[]),
+                // otherwise clients just see an opaque "Validation error"
+                $details = [];
+                foreach ((array) ($decoded['errorMessages'] ?? []) as $err) {
+                    if (!is_array($err)) continue;
+                    $path    = preg_replace('/^body\./', '', (string) ($err['path'] ?? ''));
+                    $detail  = (string) ($err['message'] ?? '');
+                    if ($detail === '') continue;
+                    $details[] = $path !== '' && $path !== '0' ? $path . ' ' . lcfirst($detail) : $detail;
+                }
+                if ($details) {
+                    $message .= ' (' . implode('; ', array_slice(array_unique($details), 0, 5)) . ')';
+                }
                 throw new GetBDApiException($message, $status);
             }
 
