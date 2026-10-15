@@ -63,6 +63,14 @@ class ApiClient
         return $this->request('GET', '/domains/info', ['query' => ['domain' => $domain]]);
     }
 
+    /**
+     * All domains on the partner account (admin import list).
+     */
+    public function listDomains(): array
+    {
+        return $this->request('GET', '/domains');
+    }
+
     public function processOrder(string $orderId): array
     {
         return $this->request('POST', '/orders/' . rawurlencode($orderId) . '/process');

@@ -111,6 +111,22 @@ service detail page (see `NOTIFICATION_LINKS` in `coremio/helpers/admin.php`).
 | `getbd-document-upload-failed` | warning | any document could not reach get.bd (upload via partner portal fallback) |
 | `getbd-reservation-problem` | error | order not found / 7-day reservation expired |
 
+## Admin options
+
+API Key · Send extended (v2) order fields · Activation check interval (minutes) ·
+Order process retry interval (hours) · Default Nameservers (core-managed) ·
+Test Connection. (Development-mode/base-URL overrides and the default-country setting
+were removed by request — production endpoints are hardcoded and country is always `BD`.)
+
+## Importing existing domains
+
+The module exposes `domains()` + `get_info()`, so the registrar settings screen shows
+WiseCP's native **Import Domains** tab: it lists every domain on the partner account
+(`GET /domains`), shows which are already assigned in WiseCP, and lets the admin assign
+a client and import (service created active with the registry's creation/expiry dates,
+nameservers and registrant WHOIS from `get_info()`). Imported domains are active, so they
+never enter the verify-to-active flow.
+
 ## Admin notes
 
 - If `getbd_error` mentions the **wallet** or **RESERVATION_EXPIRED**, fix it in the

@@ -116,37 +116,12 @@ class GetBD extends RegistrarModule
                 'description' => $this->lang['fields']['api-key-desc'] ?? 'Your get.bd partner API key.',
                 'value' => $settings['api-key'] ?? '',
             ],
-            'test-mode' => [
-                'type' => 'approval',
-                'name' => $this->lang['fields']['test-mode'] ?? 'Development Mode',
-                'description' => $this->lang['fields']['test-mode-desc'] ?? 'Point the module at a self-hosted get.bd development API instead of production.',
-                'value' => 1,
-                'checked' => (bool) ($settings['test-mode'] ?? false),
-            ],
-            'base-url' => [
-                'type' => 'text',
-                'name' => $this->lang['fields']['base-url'] ?? 'API Base URL (v1)',
-                'description' => $this->lang['fields']['base-url-desc'] ?? 'Advanced. Default: https://api.get.bd/api/v1/external — use http://localhost:4000/api/v1/external for local development.',
-                'value' => $settings['base-url'] ?? '',
-            ],
-            'v2-base-url' => [
-                'type' => 'text',
-                'name' => $this->lang['fields']['v2-base-url'] ?? 'API Base URL (v2)',
-                'description' => $this->lang['fields']['v2-base-url-desc'] ?? 'Advanced. Default: https://api.get.bd/api/v2/external.',
-                'value' => $settings['v2-base-url'] ?? '',
-            ],
             'send-v2-fields' => [
                 'type' => 'approval',
                 'name' => $this->lang['fields']['send-v2-fields'] ?? 'Send extended (v2) order fields',
                 'description' => $this->lang['fields']['send-v2-fields-desc'] ?? 'Include companyName / city / state / postcode / country in the create-order payload when provided.',
                 'value' => 1,
                 'checked' => (bool) ($settings['send-v2-fields'] ?? true),
-            ],
-            'default-country' => [
-                'type' => 'text',
-                'name' => $this->lang['fields']['default-country'] ?? 'Default country (ISO 2)',
-                'description' => $this->lang['fields']['default-country-desc'] ?? 'Used for the v2 "country" field when the client does not provide one.',
-                'value' => $settings['default-country'] ?? 'BD',
             ],
             'cron-interval-minutes' => [
                 'type' => 'text',
@@ -374,6 +349,127 @@ class GetBD extends RegistrarModule
         ];
     }
 
+    /* ================================================== import ======= */
+
+    /**
+     * Partner-account domain list for the admin Import Domains screen.
+     * WiseCP's registrar settings template renders this automatically
+     * (client assignment + import) when the module exposes domains().
+     */
+    public function domains()
+    {
+        $this->initApi();
+
+        try {
+            $response = $this->api->listDomains();
+        } catch (\Throwable $e) {
+            $this->error = $e->getMessage();
+            return false;
+        }
+
+        $list = $response['data'] ?? [];
+        if (isset($list['items']) && is_array($list['items'])) $list = $list['items'];
+        elseif (isset($list['domains']) && is_array($list['domains'])) $list = $list['domains'];
+        elseif (isset($list['list']) && is_array($list['list'])) $list = $list['list'];
+        if (!is_array($list)) $list = [];
+
+        $result = [];
+        foreach ($list as $item) {
+            if (!is_array($item)) continue;
+
+            $domain = strtolower((string) ($item['domain'] ?? $item['domainName'] ?? ''));
+            if ($domain === '') continue;
+            $domain = idn_to_utf8($domain, 0, INTL_IDNA_VARIANT_UTS46) ?: $domain;
+
+            $local = $item['localDomain'] ?? [];
+
+            // already in WiseCP? attach the local order + client
+            $order_id = 0;
+            $user_data = [];
+            $existing = \WDB::select('id, owner_id AS user_id')->from('users_products');
+            $existing->where('type', '=', 'domain', '&&');
+            $existing->where('name', '=', $domain);
+            $existing = $existing->build() ? $existing->getAssoc() : false;
+            if (is_array($existing) && isset($existing['id'])) {
+                $order_id = (int) $existing['id'];
+                $user_data = \User::getData((int) $existing['user_id'], 'id,full_name,company_name', 'array') ?: [];
+            }
+
+            $result[] = [
+                'domain'        => $domain,
+                'creation_date' => $this->normalizeDate((string) ($item['activationDate'] ?? '')),
+                'end_date'      => $this->normalizeDate((string) ($local['expiryDate'] ?? $item['expiryDate'] ?? '')),
+                'order_id'      => $order_id,
+                'user_data'     => $user_data,
+            ];
+        }
+
+        return $result;
+    }
+
+    /**
+     * Registrar-side details for one domain — consumed by the core
+     * import_domain() when the admin imports it onto a client.
+     */
+    public function get_info(array $params = []): array|false
+    {
+        $this->initApi();
+
+        $domain = idn_to_ascii(
+            (string) ($params['domain'] ?? $this->options['domain'] ?? $this->service['name'] ?? ''),
+            0,
+            INTL_IDNA_VARIANT_UTS46
+        );
+        if ($domain === false || $domain === '') {
+            $this->error = $this->lang['error3'] ?? 'The domain name is invalid.';
+            return false;
+        }
+
+        try {
+            $info = $this->api->getDomainInfo($domain);
+        } catch (\Throwable $e) {
+            $this->error = $e->getMessage();
+            return false;
+        }
+
+        if (empty($info['success']) || empty($info['data'])) {
+            $this->error = (string) ($info['message'] ?? 'Unable to retrieve domain information');
+            return false;
+        }
+
+        $data = $info['data'];
+        $local = $data['localDomain'] ?? [];
+
+        $result = [
+            'creation_time' => $this->normalizeDate((string) ($data['activationDate'] ?? '')),
+            'end_time' => $this->normalizeDate((string) ($local['expiryDate'] ?? $data['expiryDate'] ?? '')),
+            'transferlock' => false,
+        ];
+
+        foreach ([1 => 'primaryDns', 2 => 'secondaryDns', 3 => 'tertiaryDns'] as $i => $key) {
+            if (!empty($data[$key])) $result['ns' . $i] = (string) $data[$key];
+        }
+
+        if (!empty($data['clientFullName']) || !empty($data['clientEmail'])) {
+            $result['whois'] = [
+                'registrant' => [
+                    'Name' => (string) ($data['clientFullName'] ?? ''),
+                    'Company' => '',
+                    'EMail' => (string) ($data['clientEmail'] ?? ''),
+                    'Phone' => (string) ($data['clientContactNumber'] ?? ''),
+                    'PhoneCountryCode' => '',
+                ],
+            ];
+        }
+
+        return $result;
+    }
+
+    private function normalizeDate(string $date): string
+    {
+        return $date === '' ? '' : substr($date, 0, 10);
+    }
+
     /* ======================================= verification pipeline === */
 
     /**
@@ -478,18 +574,17 @@ class GetBD extends RegistrarModule
             $settings = $this->settings();
             $sendV2 = (bool) ($settings['send-v2-fields'] ?? true);
 
+            // country is always BD for .bd registrations
             $v2 = [
                 'companyName' => mb_substr($post('company_name'), 0, 120),
                 'city' => mb_substr($post('city'), 0, 60),
                 'state' => mb_substr($post('post_state'), 0, 60),
                 'postcode' => mb_substr($post('postcode'), 0, 12),
-                'country' => strtoupper(mb_substr(preg_replace('/[^A-Za-z]/', '', $post('country')), 0, 2)),
+                'country' => 'BD',
             ];
             if (!$sendV2) {
                 $v2 = array_map(static fn($v) => '', $v2);
-            }
-            if ($v2['country'] === '') {
-                $v2['country'] = strtoupper(substr((string) ($settings['default-country'] ?? 'BD'), 0, 2));
+                $v2['country'] = '';
             }
             if ($v2['postcode'] !== '' && (!preg_match('/^\d{1,9}$/', $v2['postcode']) || (int) $v2['postcode'] < 1)) {
                 $this->respondJson('error', $this->lang['verify']['err-postcode'] ?? 'Postcode must be digits only (e.g. 9100).');
@@ -1143,7 +1238,6 @@ class GetBD extends RegistrarModule
                         <div class="col-md-6"><label class="form-label">{$lang['phone']} *</label><input type="text" class="form-control" name="contact_number" required maxlength="20" placeholder="+8801XXXXXXXXX"></div>
                         <div class="col-12"><label class="form-label">{$lang['address']} *</label><textarea class="form-control" name="contact_address" rows="2" required maxlength="250"></textarea></div>
                         <div class="col-md-6"><label class="form-label">{$lang['company']}</label><input type="text" class="form-control" name="company_name" maxlength="120"></div>
-                        <div class="col-md-6"><label class="form-label">{$lang['country']}</label><input type="text" class="form-control" name="country" maxlength="2" placeholder="BD"></div>
                         <div class="col-md-4"><label class="form-label">{$lang['city']}</label><input type="text" class="form-control" name="city" maxlength="60"></div>
                         <div class="col-md-4"><label class="form-label">{$lang['state']}</label><input type="text" class="form-control" name="post_state" maxlength="60"></div>
                         <div class="col-md-4"><label class="form-label">{$lang['postcode']}</label><input type="text" class="form-control" name="postcode" maxlength="12"></div>
@@ -1284,7 +1378,6 @@ class GetBD extends RegistrarModule
 
         var form = modalEl.querySelector('#getbd-verify-form');
         form.reset();
-        modalEl.querySelector('input[name="country"]').value = '';
 
         var secRow = modalEl.querySelector('#getbd-sec-row');
         var passRow = modalEl.querySelector('#getbd-pass-row');
